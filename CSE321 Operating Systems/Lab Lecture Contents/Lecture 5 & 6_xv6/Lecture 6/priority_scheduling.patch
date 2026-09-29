@@ -1,0 +1,233 @@
+diff --git a/Makefile b/Makefile
+index b262c0a..b4da278 100644
+--- a/Makefile
++++ b/Makefile
+@@ -145,6 +145,7 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_test_priority\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -166,7 +167,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22a5401..2c0b121 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -227,6 +227,8 @@ userinit(void)
+   p->cwd = namei("/");
+ 
+   p->state = RUNNABLE;
++  p->priority = 1;
++  p->turns = 0;
+ 
+   release(&p->lock);
+ }
+@@ -300,6 +302,8 @@ kfork(void)
+ 
+   acquire(&np->lock);
+   np->state = RUNNABLE;
++  np->priority = p->priority;
++  np->turns = 0;
+   release(&np->lock);
+ 
+   return pid;
+@@ -424,44 +428,49 @@ kwait(uint64 addr)
+ void
+ scheduler(void)
+ {
+-  struct proc *p;
+   struct cpu *c = mycpu();
+-
+   c->proc = 0;
++
+   for(;;){
+-    // The most recent process to run may have had interrupts
+-    // turned off; enable them to avoid a deadlock if all
+-    // processes are waiting. Then turn them back off
+-    // to avoid a possible race between an interrupt
+-    // and wfi.
+     intr_on();
+-    intr_off();
+ 
+-    int found = 0;
+-    for(p = proc; p < &proc[NPROC]; p++) {
++    struct proc *bestproc = 0;
++    int bestprio = 11;       // higher than any valid priority
++
++    // Step 1: Find RUNNABLE process with highest priority
++    for(struct proc *p = proc; p < &proc[NPROC]; p++){
+       acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
++      if(p->state == RUNNABLE && p->priority < bestprio){
++        if(bestproc != 0)
++          release(&bestproc->lock);
++        bestproc = p;
++        bestprio = p->priority;
++      } else {
++        release(&p->lock);
+       }
+-      release(&p->lock);
+     }
+-    if(found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
++
++    // No RUNNABLE processes
++    if(bestproc == 0){
+       asm volatile("wfi");
++      continue;
+     }
++
++    // Step 2: Run the selected process
++    bestproc->turns++;      // track scheduling count
++    bestproc->state = RUNNING;
++    c->proc = bestproc;
++
++    swtch(&c->context, &bestproc->context);
++
++    // Step 3: When the process yields/sleeps/exits:
++    c->proc = 0;
++
++    release(&bestproc->lock);
+   }
+ }
+ 
++
+ // Switch to scheduler.  Must hold only p->lock
+ // and have changed proc->state. Saves and restores
+ // intena because intena is a property of this
+@@ -684,7 +693,7 @@ procdump(void)
+       state = states[p->state];
+     else
+       state = "???";
+-    printf("%d %s %s", p->pid, state, p->name);
++    printf("%d %s %s %d %d", p->pid, state, p->name, p->priority, p->turns);
+     printf("\n");
+   }
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..b0bf5f8 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -91,6 +91,8 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  int priority;                //max:1 min:10
++  int turns; 
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..78bb63d 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_setpriority(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_setpriority] sys_setpriority,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..ab4eeb9 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_setpriority 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..9b28947 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -7,6 +7,23 @@
+ #include "proc.h"
+ #include "vm.h"
+ 
++uint64
++sys_setpriority(void)
++{
++  int pr;
++  argint(0, &pr);
++
++  if(pr < 1 || pr > 10)
++    return -1;
++
++  struct proc *p = myproc();
++  acquire(&p->lock);
++  p->priority = pr;
++  release(&p->lock);
++
++  return 0;
++}
++
+ uint64
+ sys_exit(void)
+ {
+diff --git a/user/test_priority.c b/user/test_priority.c
+new file mode 100644
+index 0000000..7021d11
+--- /dev/null
++++ b/user/test_priority.c
+@@ -0,0 +1,9 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int main(int argc, char* argv[]) {
++  int priority = atoi(argv[1]);
++  setpriority(priority);
++  while(1) {}
++  return 0;
++}
+diff --git a/user/user.h b/user/user.h
+index ac84de9..6bf8205 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,7 @@ int getpid(void);
+ char* sys_sbrk(int,int);
+ int pause(int);
+ int uptime(void);
++int setpriority(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..52627ab 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("setpriority");
